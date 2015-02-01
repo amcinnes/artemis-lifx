@@ -2,6 +2,8 @@ import socket
 import struct
 import time
 import threading
+import base64
+import logging
 
 class BaseStructure:
     _format_prefix = '>'
@@ -216,8 +218,25 @@ def string_descriptor(s):
     l = chr(len(encoded) + 2)
     return l + '\x03' + encoded
 
+class DmxProcessor():
+    def __init__(self):
+        self.packet = ''
+        self.brk = True
+
+    def break_on(self):
+        if not self.brk:
+            self.brk = True
+            print(base64.b64encode(self.packet))
+
+    def break_off(self):
+        if self.brk:
+            self.brk = False
+            self.packet = ''
+
+    def data(self, d):
+        self.packet += d
+
 class USBServer():
-    # configuration + interface + endpoints
     device_descriptor = \
         DeviceDescriptor(
             bDeviceClass = 0,
@@ -269,6 +288,13 @@ class USBServer():
             bInterval = 0
         ).pack()
 
+    string_descriptors = [
+        '\x04\x03\x09\x04',
+        string_descriptor('FTDI'),
+        string_descriptor('FT232R USB UART'),
+        string_descriptor('A900DGX9')
+    ]
+
     def send_usb_req(self, usb_req, usb_res, status=0):
         self.connection.sendall(
             USBIPRETSubmit(
@@ -283,59 +309,50 @@ class USBServer():
             ).pack() + usb_res)
 
     def handle_get_descriptor(self, setup, usb_req):
-        handled = False
         if setup.wValue == 0x0100: # Device
-            print 'Get Device Descriptor'
-            handled = True
+            logging.debug('Get Device Descriptor')
             self.send_usb_req(usb_req, self.device_descriptor.pack())
         elif setup.wValue == 0x0200: # configuration
-            print 'Get Configuration Descriptor'
-            handled = True
+            logging.debug('Get Configuration Descriptor')
             self.send_usb_req(usb_req, self.configuration_descriptor_string)
-        elif setup.wValue == 0x0300: # string
-            print 'Get String Descriptor 0'
-            handled = True
-            self.send_usb_req(usb_req, '\x04\x03\x09\x04')
-        elif setup.wValue == 0x0301: # string
-            print 'Get String Descriptor 1'
-            handled = True
-            self.send_usb_req(usb_req, string_descriptor('FTDI'))
-        elif setup.wValue == 0x0302: # string
-            print 'Get String Descriptor 2'
-            handled = True
-            self.send_usb_req(usb_req, string_descriptor('FT232R USB UART'))
-        elif setup.wValue == 0x0303: # string
-            print 'Get String Descriptor 3'
-            handled = True
-            self.send_usb_req(usb_req, string_descriptor('A900DGX9'))
-        return handled
+        elif (setup.wValue & 0xff00) == 0x0300: # string
+            index = setup.wValue & 0x00ff
+            logging.debug('Get String Descriptor %d' % index)
+            self.send_usb_req(usb_req, self.string_descriptors[index])
+        else:
+            return False
+        return True
 
     def handle_usb_control(self, req):
         handled = False
-        if req.setup.bmRequestType == 0x80: # Host Request
+        if req.setup.bmRequestType == 0x80: # Standard device-to-host
             if req.setup.bRequest == 0x6: # Get Descriptor
                 handled = self.handle_get_descriptor(req.setup, req)
-            if req.setup.bRequest == 0x0: # Get Status
-                print 'Get Status'
+            elif req.setup.bRequest == 0x0: # Get Status
+                logging.debug('Get Status')
                 self.send_usb_req(req, '\x00\x00')
                 handled = True
-        elif req.setup.bmRequestType == 0x00:
+        elif req.setup.bmRequestType == 0x00: # Standard host-to-device
             if req.setup.bRequest == 0x9: # Set Configuration
-                print 'Set Configuration'
+                logging.debug('Set Configuration')
                 self.send_usb_req(req, '')
                 handled = True
-        elif req.setup.bmRequestType == 0xc0:
-            if req.setup.bRequest == 0x90: # ?
-                print 'First ignored request type'
+        elif req.setup.bmRequestType == 0x40: # Vendor host-to-device
+            if req.setup.bRequest == 0x04: # FTDI_SIO_SET_DATA
+                if req.setup.wValue & 0x4000:
+                    logging.debug('Break on')
+                    self.dmx_processor.break_on()
+                else:
+                    logging.debug('Break off')
+                    self.dmx_processor.break_off()
                 self.send_usb_req(req, '')
                 handled = True
         if not handled:
             if req.direction == 0:
-                print 'Unknown control write'
+                logging.debug('Unknown control write')
                 self.send_usb_req(req, '')
             else:
-                print 'Unknown control read'
-                print(req)
+                logging.debug('Unknown control read')
                 self.send_usb_req(req, '\x00')
 
     def empty_reply_later(self, usb_req):
@@ -349,14 +366,13 @@ class USBServer():
         if usb_req.ep == 0:
             self.handle_usb_control(usb_req)
         elif usb_req.ep == 1:
-            print('Read data')
+            logging.debug('Host reads data')
             self.empty_reply_later(usb_req)
         elif usb_req.ep == 2:
-            # The host is sending data
-            # Read it
+            logging.debug('Host writes data')
             l = self.connection.recv(usb_req.transfer_buffer_length)
             assert(len(l) == usb_req.transfer_buffer_length)
-            print('DATA: %s'%repr(l))
+            self.dmx_processor.data(l)
             self.send_usb_req(usb_req, '')
         else:
             assert(False)
@@ -412,9 +428,9 @@ class USBServer():
         s.listen(5)
         attached = False
         while 1:
-            print 'Listening for connection on %s:%d' % (ip, port)
+            logging.info('Listening for connection on %s:%d' % (ip, port))
             conn, addr = s.accept()
-            print 'Received connection from %s:%d' % addr
+            logging.info('Received connection from %s:%d' % addr)
             while 1:
                 if not attached:
                     req = USBIPHeader()
@@ -423,24 +439,25 @@ class USBServer():
                         break
                     req.unpack(data)
                     if req.command == 0x8005:
-                        print 'List devices'
+                        logging.info('List devices')
                         conn.sendall(self.handle_device_list().pack())
                     elif req.command == 0x8003:
-                        print 'Attach device'
-                        conn.recv(32)  # receive bus id
+                        logging.info('Attach device')
+                        conn.recv(32)  # receive and ignore bus id
                         conn.sendall(self.handle_attach().pack())
                         attached = True
+                        self.dmx_processor = DmxProcessor()
                     else:
-                        print 'Unknown command: %04x' % (req.command,)
-                        assert(False)
+                        raise Exception('Unsupported OP_REQ command: %04x' % (req.command,))
                 else:
                     cmd = USBIPCMDSubmit()
                     data = conn.recv(cmd.size())
                     cmd.unpack(data)
-                    assert(cmd.command == 1)
+                    if cmd.command != 1:
+                        raise Exception('Unsupported USBIP_CMD command: %08x' % (req.command,))
                     self.connection = conn
                     self.handle_usb_request(cmd)
-            print 'Closing connection'
+            logging.info('Closing connection')
             conn.close()
 
 USBServer().run()
