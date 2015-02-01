@@ -1,0 +1,16 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    bindata (2.1.0)
+    configatron (3.2.0)
+    lifx (0.4.11)
+      bindata (~> 2.0)
+      configatron (~> 3.0)
+      timers (~> 1.0)
+    timers (1.1.0)
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  lifx (~> 0.4)

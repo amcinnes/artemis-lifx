@@ -4,6 +4,7 @@ import time
 import threading
 import base64
 import logging
+import sys
 
 class BaseStructure:
     _format_prefix = '>'
@@ -226,7 +227,9 @@ class DmxProcessor():
     def break_on(self):
         if not self.brk:
             self.brk = True
+            sys.stderr.write(repr(self.packet[1:4]) + '\n')
             print(base64.b64encode(self.packet))
+            sys.stdout.flush()
 
     def break_off(self):
         if self.brk:
